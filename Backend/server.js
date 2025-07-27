@@ -1,6 +1,5 @@
 import express from 'express';
 import cors from 'cors';
-import http from 'http';
 import { Server } from 'socket.io';
 import authRoutes from './routes/authRoutes.js';
 import connectDB from './database/database.js';
@@ -11,19 +10,19 @@ import os from 'os';
 import chokidar from 'chokidar';
 import roomModel from './models/roomModel.js';
 import bcrypt from 'bcrypt';
+import http from 'http';
 
 const app = express();
 
 // Enhanced CORS configuration
 app.use(cors({
-    origin: ["http://localhost:3000", "http://127.0.0.1:3000"],
+    origin: ["http://localhost:3000", "http://127.0.0.1:3000","https://code2gether-backend.onrender.com"],
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
 app.use(express.json());
-
 // Create HTTP server first
 const server = http.createServer(app);
 
@@ -33,8 +32,9 @@ app.use('/api/auth', authRoutes);
 // Enhanced Socket.IO configuration with better error handling
 const io = new Server(server, {
     cors: {
-        origin: ["http://localhost:3000", "http://127.0.0.1:3000"],
+        origin: ["http://localhost:3000", "http://127.0.0.1:3000","https://code2gether-backend.onrender.com"],
         methods: ["GET", "POST"],
+        allowedHeaders: ["Content-Type", "Authorization"],
         credentials: true
     },
     allowEIO3: true,
@@ -145,19 +145,33 @@ class TerminalManager {
 
             watcher
                 .on('add', (filePath) => {
-                    const fileName = path.basename(filePath);
-                    console.log(`File ${fileName} has been added to ${roomCode}`);
-                    this.syncFileFromTerminalToRoom(roomCode, fileName, filePath);
+                    const relativePath = path.relative(workDir, filePath);
+                    console.log(`File ${relativePath} has been added to ${roomCode}`);
+                    this.syncFileFromTerminalToRoom(roomCode, relativePath, filePath);
                 })
                 .on('change', (filePath) => {
-                    const fileName = path.basename(filePath);
-                    console.log(`File ${fileName} has been changed in terminal for ${roomCode}`);
-                    this.syncFileFromTerminalToRoom(roomCode, fileName, filePath);
+                    const relativePath = path.relative(workDir, filePath);
+                    console.log(`File ${relativePath} has been changed in terminal for ${roomCode}`);
+                    this.syncFileFromTerminalToRoom(roomCode, relativePath, filePath);
                 })
                 .on('unlink', (filePath) => {
-                    const fileName = path.basename(filePath);
-                    console.log(`File ${fileName} has been removed from ${roomCode}`);
-                    this.removeFileFromRoomFiles(roomCode, fileName);
+                    const relativePath = path.relative(workDir, filePath);
+                    console.log(`File ${relativePath} has been removed from ${roomCode}`);
+                    this.removeFileFromRoomFiles(roomCode, relativePath);
+                })
+                .on('addDir', (dirPath) => {
+                    const relativePath = path.relative(workDir, dirPath);
+                    if (relativePath && relativePath !== '.') {
+                        console.log(`Directory ${relativePath} has been added to ${roomCode}`);
+                        this.syncFolderFromTerminalToRoom(roomCode, relativePath);
+                    }
+                })
+                .on('unlinkDir', (dirPath) => {
+                    const relativePath = path.relative(workDir, dirPath);
+                    if (relativePath && relativePath !== '.') {
+                        console.log(`Directory ${relativePath} has been removed from ${roomCode}`);
+                        this.removeFolderFromRoomFiles(roomCode, relativePath);
+                    }
                 });
 
             this.fileWatchers.set(roomCode, watcher);
@@ -190,7 +204,8 @@ class TerminalManager {
                 roomFiles[roomCode][fileName] = {
                     content: content,
                     type: 'file',
-                    extension: extension
+                    extension: extension,
+                    isExpanded: false
                 };
                 
                 // Emit updates to all clients in the room
@@ -208,13 +223,51 @@ class TerminalManager {
         }
     }
 
+    // Sync folder from terminal to room
+    syncFolderFromTerminalToRoom(roomCode, folderPath) {
+        const syncKey = `terminal-folder-${roomCode}-${folderPath}`;
+        
+        if (this.fileSyncInProgress.has(syncKey)) {
+            return;
+        }
+        
+        this.fileSyncInProgress.add(syncKey);
+        
+        try {
+            if (!roomFiles[roomCode]) {
+                roomFiles[roomCode] = {};
+            }
+            
+            if (!roomFiles[roomCode][folderPath]) {
+                roomFiles[roomCode][folderPath] = {
+                    type: 'folder',
+                    isExpanded: false
+                };
+                
+                // Emit updates to all clients in the room
+                io.to(roomCode).emit('files-update', roomFiles[roomCode]);
+                io.to(roomCode).emit('folder-created', { folderPath });
+                
+                console.log(`Folder ${folderPath} synced from terminal to room ${roomCode}`);
+            }
+        } catch (error) {
+            console.error(`Error syncing folder ${folderPath} from terminal to room ${roomCode}:`, error);
+        } finally {
+            setTimeout(() => {
+                this.fileSyncInProgress.delete(syncKey);
+            }, 300);
+        }
+    }
+
     // Remove file from roomFiles when deleted from working directory
     removeFileFromRoomFiles(roomCode, fileName) {
         if (roomFiles[roomCode] && roomFiles[roomCode][fileName]) {
             delete roomFiles[roomCode][fileName];
             
             // If this was someone's active file, switch them to another file
-            const remainingFiles = Object.keys(roomFiles[roomCode]);
+            const remainingFiles = Object.keys(roomFiles[roomCode]).filter(key => 
+                roomFiles[roomCode][key].type === 'file'
+            );
             if (remainingFiles.length > 0) {
                 const newActiveFile = remainingFiles[0];
                 
@@ -231,9 +284,28 @@ class TerminalManager {
             }
             
             io.to(roomCode).emit('files-update', roomFiles[roomCode]);
-            io.to(roomCode).emit('file-deleted', { fileName });
+            io.to(roomCode).emit('item-deleted', { itemPath: fileName, type: 'file' });
             
             console.log(`File ${fileName} removed from room ${roomCode}`);
+        }
+    }
+
+    // Remove folder from roomFiles when deleted from working directory
+    removeFolderFromRoomFiles(roomCode, folderPath) {
+        if (roomFiles[roomCode]) {
+            // Remove folder and all its contents
+            const keysToDelete = Object.keys(roomFiles[roomCode]).filter(key => 
+                key === folderPath || key.startsWith(folderPath + '/')
+            );
+            
+            keysToDelete.forEach(key => {
+                delete roomFiles[roomCode][key];
+            });
+            
+            io.to(roomCode).emit('files-update', roomFiles[roomCode]);
+            io.to(roomCode).emit('item-deleted', { itemPath: folderPath, type: 'folder' });
+            
+            console.log(`Folder ${folderPath} and its contents removed from room ${roomCode}`);
         }
     }
 
@@ -242,12 +314,32 @@ class TerminalManager {
         const workDir = this.sharedWorkingDirectories.get(roomCode);
         if (!workDir || !roomFiles[roomCode]) return;
 
-        Object.keys(roomFiles[roomCode]).forEach(fileName => {
-            const fileData = roomFiles[roomCode][fileName];
-            if (fileData.type === 'file') {
-                this.writeFileToWorkingDir(roomCode, fileName, fileData.content);
+        Object.keys(roomFiles[roomCode]).forEach(itemPath => {
+            const itemData = roomFiles[roomCode][itemPath];
+            if (itemData.type === 'file') {
+                this.writeFileToWorkingDir(roomCode, itemPath, itemData.content);
+            } else if (itemData.type === 'folder') {
+                this.createFolderInWorkingDir(roomCode, itemPath);
             }
         });
+    }
+
+    // Create folder in working directory
+    createFolderInWorkingDir(roomCode, folderPath) {
+        const workDir = this.sharedWorkingDirectories.get(roomCode);
+        if (!workDir) return false;
+
+        try {
+            const fullPath = path.join(workDir, folderPath);
+            if (!fs.existsSync(fullPath)) {
+                fs.mkdirSync(fullPath, { recursive: true });
+                console.log(`Folder ${folderPath} created in working directory for room ${roomCode}`);
+            }
+            return true;
+        } catch (error) {
+            console.error(`Error creating folder ${folderPath} in working directory:`, error);
+            return false;
+        }
     }
 
     // Write single file to working directory with better sync control
@@ -268,6 +360,12 @@ class TerminalManager {
 
         try {
             const filePath = path.join(workDir, fileName);
+            const fileDir = path.dirname(filePath);
+            
+            // Create directory if it doesn't exist
+            if (!fs.existsSync(fileDir)) {
+                fs.mkdirSync(fileDir, { recursive: true });
+            }
             
             // Only write if content has changed
             let shouldWrite = true;
@@ -421,12 +519,12 @@ const roomFiles = {};
 const userActiveFiles = {};
 const userSession = new Map();
 
-
 const getDefaultFiles = () => ({
     'main.js': {
         content: '// start typing...',
         type: 'file',
-        extension: 'js'
+        extension: 'js',
+        isExpanded: false
     }
 });
 
@@ -485,7 +583,6 @@ io.on('connection', (socket) => {
         }
     });
 
-
     socket.on('join-room', async({ username, roomCode, password }, callback) => {
         console.log(`${username} attempting to join room: ${roomCode}`);
 
@@ -513,31 +610,7 @@ io.on('connection', (socket) => {
                 joined: new Date()
             })
 
-            const existingSession = userSession.get(socket.id);
-            let isAuthenticated = false;
-
-            if(existingSession && existingSession.roomCode === roomCode){
-                isAuthenticated = true;
-                console.log(`user ${socket.id} has existing session for room ${roomCode}`)
-            }else{
-                 const isPasswordValid = await bcrypt.compare(password, room.password);
-                if(!isPasswordValid){
-                    return callback({
-                        success: false,
-                        error: 'Invalid password. Please try again.'
-                    });
-                }
-                isAuthenticated = true;
-            }
-
-            if(isAuthenticated){
-                userSession.set(socket.id,{
-                    roomCode:roomCode,
-                    username: username,
-                    joinedAt: new Date()
-                })
-
-                // If room doesn't exist in memory, create it
+            // If room doesn't exist in memory, create it
             if (!rooms[roomCode]) {
                 console.log(`Room ${roomCode} not found in memory, creating it...`);
                 rooms[roomCode] = [];
@@ -557,7 +630,10 @@ io.on('connection', (socket) => {
             socket.username = username;
 
             // Set default active file for this user
-            const firstFile = Object.keys(roomFiles[roomCode])[0];
+            const fileKeys = Object.keys(roomFiles[roomCode]).filter(key => 
+                roomFiles[roomCode][key].type === 'file'
+            );
+            const firstFile = fileKeys[0];
             userActiveFiles[socket.id] = firstFile;
             
             // Initialize terminal for this specific user
@@ -575,8 +651,6 @@ io.on('connection', (socket) => {
             });
             
             console.log(`${username} joined room ${roomCode}`);
-
-            }
             
         } catch (error) {
             console.error('Error joining room:', error);
@@ -597,7 +671,7 @@ io.on('connection', (socket) => {
     socket.on('get-file-content', ({ roomCode, fileName }, callback) => {
         console.log(`Getting content for file: ${fileName} in room: ${roomCode}`);
         const fileEntry = roomFiles[roomCode]?.[fileName];
-        const content = fileEntry ? fileEntry.content : '';
+        const content = fileEntry && fileEntry.type === 'file' ? fileEntry.content : '';
         callback({ content });
     });
 
@@ -620,7 +694,7 @@ io.on('connection', (socket) => {
     });
 
     socket.on('run-file', ({ roomCode, fileName }) => {
-        if (roomFiles[roomCode] && roomFiles[roomCode][fileName]) {
+        if (roomFiles[roomCode] && roomFiles[roomCode][fileName] && roomFiles[roomCode][fileName].type === 'file') {
             // Ensure file is written to working directory before running
             terminalManager.writeFileToWorkingDir(roomCode, fileName, roomFiles[roomCode][fileName].content);
             terminalManager.runFile(socket.id, fileName);
@@ -631,7 +705,7 @@ io.on('connection', (socket) => {
 
     socket.on('save-and-run', ({ roomCode, fileName }) => {
         const targetFileName = fileName || userActiveFiles[socket.id];
-        if (targetFileName && roomFiles[roomCode] && roomFiles[roomCode][targetFileName]) {
+        if (targetFileName && roomFiles[roomCode] && roomFiles[roomCode][targetFileName] && roomFiles[roomCode][targetFileName].type === 'file') {
             terminalManager.writeFileToWorkingDir(roomCode, targetFileName, roomFiles[roomCode][targetFileName].content);
             terminalManager.runFile(socket.id, targetFileName);
         }
@@ -653,133 +727,357 @@ io.on('connection', (socket) => {
         callback({ workingDirectory: workDir });
     });
 
-    // File Management Events
-    socket.on('create-file', ({ roomCode, fileName, fileType = 'file' }) => {
-        console.log(`Creating file: ${fileName} in room: ${roomCode}`);
+    // Enhanced File Management Events with Folder Support
+
+    // Create File
+    socket.on('create-file', ({ roomCode, fileName, parentFolder = '' }) => {
+        console.log(`Creating file: ${fileName} in folder: ${parentFolder} for room: ${roomCode}`);
         
         if (!roomFiles[roomCode]) {
             roomFiles[roomCode] = {};
         }
         
-        if (roomFiles[roomCode][fileName]) {
+        const fullPath = parentFolder ? `${parentFolder}/${fileName}` : fileName;
+        
+        if (roomFiles[roomCode][fullPath]) {
             socket.emit('file-error', { message: 'File already exists' });
             return;
         }
         
         const extension = fileName.split('.').pop() || 'txt';
         
-        roomFiles[roomCode][fileName] = {
+        roomFiles[roomCode][fullPath] = {
             content: getDefaultContent(extension),
-            type: fileType,
-            extension: extension
+            type: 'file',
+            extension: extension,
+            isExpanded: false
         };
         
         // Write to working directory
-        terminalManager.writeFileToWorkingDir(roomCode, fileName, roomFiles[roomCode][fileName].content);
+        terminalManager.writeFileToWorkingDir(roomCode, fullPath, roomFiles[roomCode][fullPath].content);
         
         io.to(roomCode).emit('files-update', roomFiles[roomCode]);
-        io.to(roomCode).emit('file-created', { fileName, fileType });
+        io.to(roomCode).emit('file-created', { fileName: fullPath });
         
-        console.log(`File ${fileName} created in room ${roomCode}`);
+        console.log(`File ${fullPath} created in room ${roomCode}`);
     });
 
-    socket.on('delete-file', ({ roomCode, fileName }) => {
-        console.log(`Deleting file: ${fileName} in room: ${roomCode}`);
+    // Create Folder
+    socket.on('create-folder', ({ roomCode, folderName, parentFolder = '' }) => {
+        console.log(`Creating folder: ${folderName} in parent: ${parentFolder} for room: ${roomCode}`);
         
-        if (!roomFiles[roomCode] || !roomFiles[roomCode][fileName]) {
-            socket.emit('file-error', { message: 'File not found' });
+        if (!roomFiles[roomCode]) {
+            roomFiles[roomCode] = {};
+        }
+        
+        const fullPath = parentFolder ? `${parentFolder}/${folderName}` : folderName;
+        
+        if (roomFiles[roomCode][fullPath]) {
+            socket.emit('file-error', { message: 'Folder already exists' });
             return;
         }
         
-        const fileCount = Object.keys(roomFiles[roomCode]).length;
-        if (fileCount <= 1) {
-            socket.emit('file-error', { message: 'Cannot delete the last file' });
+        roomFiles[roomCode][fullPath] = {
+            type: 'folder',
+            isExpanded: false
+        };
+        
+        // Create folder in working directory
+        terminalManager.createFolderInWorkingDir(roomCode, fullPath);
+        
+        io.to(roomCode).emit('files-update', roomFiles[roomCode]);
+        io.to(roomCode).emit('folder-created', { folderPath: fullPath });
+        
+        console.log(`Folder ${fullPath} created in room ${roomCode}`);
+    });
+
+    // Delete Item (File or Folder)
+    socket.on('delete-item', ({ roomCode, itemPath }) => {
+        console.log(`Deleting item: ${itemPath} in room: ${roomCode}`);
+        
+        if (!roomFiles[roomCode] || !roomFiles[roomCode][itemPath]) {
+            socket.emit('file-error', { message: 'Item not found' });
             return;
+        }
+        
+        const itemType = roomFiles[roomCode][itemPath].type;
+        
+        // For files, check if it's the last file
+        if (itemType === 'file') {
+            const fileCount = Object.keys(roomFiles[roomCode]).filter(key => 
+                roomFiles[roomCode][key].type === 'file'
+            ).length;
+            if (fileCount <= 1) {
+                socket.emit('file-error', { message: 'Cannot delete the last file' });
+                return;
+            }
+        }
+        
+        // Get all items to delete (for folders, include all contents)
+        const itemsToDelete = [];
+        if (itemType === 'folder') {
+            // Delete folder and all its contents
+            itemsToDelete.push(...Object.keys(roomFiles[roomCode]).filter(key => 
+                key === itemPath || key.startsWith(itemPath + '/')
+            ));
+        } else {
+            itemsToDelete.push(itemPath);
         }
         
         // Delete from working directory
         const workDir = terminalManager.getWorkingDirectory(roomCode);
         if (workDir) {
-            const filePath = path.join(workDir, fileName);
-            try {
-                if (fs.existsSync(filePath)) {
-                    fs.unlinkSync(filePath);
+            itemsToDelete.forEach(item => {
+                const fullPath = path.join(workDir, item);
+                try {
+                    if (fs.existsSync(fullPath)) {
+                        const stats = fs.statSync(fullPath);
+                        if (stats.isDirectory()) {
+                            fs.rmSync(fullPath, { recursive: true, force: true });
+                        } else {
+                            fs.unlinkSync(fullPath);
+                        }
+                    }
+                } catch (error) {
+                    console.error(`Error deleting ${item} from working directory:`, error);
                 }
-            } catch (error) {
-                console.error('Error deleting file from working directory:', error);
-            }
+            });
         }
         
-        delete roomFiles[roomCode][fileName];
-        
-        const remainingFiles = Object.keys(roomFiles[roomCode]);
-        const newActiveFile = remainingFiles[0];
-        
-        rooms[roomCode].forEach(userId => {
-            if (userActiveFiles[userId] === fileName) {
-                userActiveFiles[userId] = newActiveFile;
-                io.to(userId).emit('file-content-update', {
-                    fileName: newActiveFile,
-                    content: roomFiles[roomCode][newActiveFile].content
-                });
-                io.to(userId).emit('active-file-changed', { fileName: newActiveFile });
-            }
+        // Delete from roomFiles
+        itemsToDelete.forEach(item => {
+            delete roomFiles[roomCode][item];
         });
         
-        io.to(roomCode).emit('files-update', roomFiles[roomCode]);
-        io.to(roomCode).emit('file-deleted', { fileName });
+        // Handle active file switching if deleted file was active
+        if (itemType === 'file' || itemsToDelete.includes(userActiveFiles[socket.id])) {
+            const remainingFiles = Object.keys(roomFiles[roomCode]).filter(key => 
+                roomFiles[roomCode][key].type === 'file'
+            );
+            
+            if (remainingFiles.length > 0) {
+                const newActiveFile = remainingFiles[0];
+                
+                rooms[roomCode].forEach(userId => {
+                    if (itemsToDelete.includes(userActiveFiles[userId])) {
+                        userActiveFiles[userId] = newActiveFile;
+                        io.to(userId).emit('file-content-update', {
+                            fileName: newActiveFile,
+                            content: roomFiles[roomCode][newActiveFile].content
+                        });
+                        io.to(userId).emit('active-file-changed', { fileName: newActiveFile });
+                    }
+                });
+            }
+        }
         
-        console.log(`File ${fileName} deleted from room ${roomCode}`);
+        io.to(roomCode).emit('files-update', roomFiles[roomCode]);
+        io.to(roomCode).emit('item-deleted', { itemPath, type: itemType });
+        
+        console.log(`${itemType} ${itemPath} deleted from room ${roomCode}`);
     });
 
-    socket.on('rename-file', ({ roomCode, oldFileName, newFileName }) => {
-        console.log(`Renaming file: ${oldFileName} to ${newFileName} in room: ${roomCode}`);
+    // Rename Item (File or Folder)
+    socket.on('rename-item', ({ roomCode, oldPath, newPath }) => {
+        console.log(`Renaming item: ${oldPath} to ${newPath} in room: ${roomCode}`);
         
-        if (!roomFiles[roomCode] || !roomFiles[roomCode][oldFileName]) {
-            socket.emit('file-error', { message: 'File not found' });
+        if (!roomFiles[roomCode] || !roomFiles[roomCode][oldPath]) {
+            socket.emit('file-error', { message: 'Item not found' });
             return;
         }
         
-        if (roomFiles[roomCode][newFileName]) {
-            socket.emit('file-error', { message: 'File with new name already exists' });
+        if (roomFiles[roomCode][newPath]) {
+            socket.emit('file-error', { message: 'Item with new name already exists' });
             return;
         }
+        
+        const itemType = roomFiles[roomCode][oldPath].type;
         
         // Rename in working directory
         const workDir = terminalManager.getWorkingDirectory(roomCode);
         if (workDir) {
-            const oldPath = path.join(workDir, oldFileName);
-            const newPath = path.join(workDir, newFileName);
+            const oldFullPath = path.join(workDir, oldPath);
+            const newFullPath = path.join(workDir, newPath);
             try {
-                if (fs.existsSync(oldPath)) {
-                    fs.renameSync(oldPath, newPath);
+                if (fs.existsSync(oldFullPath)) {
+                    // Create parent directory if it doesn't exist
+                    const newDir = path.dirname(newFullPath);
+                    if (!fs.existsSync(newDir)) {
+                        fs.mkdirSync(newDir, { recursive: true });
+                    }
+                    fs.renameSync(oldFullPath, newFullPath);
                 }
             } catch (error) {
-                console.error('Error renaming file in working directory:', error);
+                console.error('Error renaming item in working directory:', error);
+                socket.emit('file-error', { message: 'Failed to rename item in working directory' });
+                return;
             }
         }
         
-        roomFiles[roomCode][newFileName] = { ...roomFiles[roomCode][oldFileName] };
-        roomFiles[roomCode][newFileName].extension = newFileName.split('.').pop() || 'txt';
-        delete roomFiles[roomCode][oldFileName];
-        
-        rooms[roomCode].forEach(userId => {
-            if (userActiveFiles[userId] === oldFileName) {
-                userActiveFiles[userId] = newFileName;
-                io.to(userId).emit('active-file-changed', { fileName: newFileName });
-            }
-        });
+        if (itemType === 'folder') {
+            // For folders, we need to rename the folder and all its contents
+            const itemsToRename = Object.keys(roomFiles[roomCode]).filter(key => 
+                key === oldPath || key.startsWith(oldPath + '/')
+            ).sort();
+            
+            // Create new entries
+            itemsToRename.forEach(itemPath => {
+                const relativePath = itemPath === oldPath ? '' : itemPath.substring(oldPath.length + 1);
+                const newItemPath = relativePath ? `${newPath}/${relativePath}` : newPath;
+                
+                roomFiles[roomCode][newItemPath] = { ...roomFiles[roomCode][itemPath] };
+                
+                // Update active files for users
+                rooms[roomCode].forEach(userId => {
+                    if (userActiveFiles[userId] === itemPath) {
+                        userActiveFiles[userId] = newItemPath;
+                        io.to(userId).emit('active-file-changed', { fileName: newItemPath });
+                    }
+                });
+            });
+            
+            // Delete old entries
+            itemsToRename.forEach(itemPath => {
+                delete roomFiles[roomCode][itemPath];
+            });
+        } else {
+            // For files, simple rename
+            roomFiles[roomCode][newPath] = { ...roomFiles[roomCode][oldPath] };
+            
+            // Update extension if changed
+            const newExtension = newPath.split('.').pop() || 'txt';
+            roomFiles[roomCode][newPath].extension = newExtension;
+            
+            delete roomFiles[roomCode][oldPath];
+            
+            // Update active files for users
+            rooms[roomCode].forEach(userId => {
+                if (userActiveFiles[userId] === oldPath) {
+                    userActiveFiles[userId] = newPath;
+                    io.to(userId).emit('active-file-changed', { fileName: newPath });
+                }
+            });
+        }
         
         io.to(roomCode).emit('files-update', roomFiles[roomCode]);
-        io.to(roomCode).emit('file-renamed', { oldFileName, newFileName });
+        io.to(roomCode).emit('item-renamed', { oldPath, newPath, type: itemType });
         
-        console.log(`File ${oldFileName} renamed to ${newFileName} in room ${roomCode}`);
+        console.log(`${itemType} ${oldPath} renamed to ${newPath} in room ${roomCode}`);
     });
 
+    // Move Item (File or Folder)
+    socket.on('move-item', ({ roomCode, sourcePath, targetPath, itemType }) => {
+        console.log(`Moving ${itemType}: ${sourcePath} to ${targetPath} in room: ${roomCode}`);
+        
+        if (!roomFiles[roomCode] || !roomFiles[roomCode][sourcePath]) {
+            socket.emit('file-error', { message: 'Source item not found' });
+            return;
+        }
+        
+        // Prevent moving a folder into itself
+        if (itemType === 'folder' && targetPath.startsWith(sourcePath + '/')) {
+            socket.emit('file-error', { message: 'Cannot move a folder into itself' });
+            return;
+        }
+        
+        if (roomFiles[roomCode][targetPath]) {
+            socket.emit('file-error', { message: 'Target location already exists' });
+            return;
+        }
+        
+        // Move in working directory
+        const workDir = terminalManager.getWorkingDirectory(roomCode);
+        if (workDir) {
+            const sourceFullPath = path.join(workDir, sourcePath);
+            const targetFullPath = path.join(workDir, targetPath);
+            try {
+                if (fs.existsSync(sourceFullPath)) {
+                    // Create parent directory if it doesn't exist
+                    const targetDir = path.dirname(targetFullPath);
+                    if (!fs.existsSync(targetDir)) {
+                        fs.mkdirSync(targetDir, { recursive: true });
+                    }
+                    fs.renameSync(sourceFullPath, targetFullPath);
+                }
+            } catch (error) {
+                console.error('Error moving item in working directory:', error);
+                socket.emit('file-error', { message: 'Failed to move item in working directory' });
+                return;
+            }
+        }
+        
+        if (itemType === 'folder') {
+            // For folders, move the folder and all its contents
+            const itemsToMove = Object.keys(roomFiles[roomCode]).filter(key => 
+                key === sourcePath || key.startsWith(sourcePath + '/')
+            ).sort();
+            
+            // Create new entries
+            itemsToMove.forEach(itemPath => {
+                const relativePath = itemPath === sourcePath ? '' : itemPath.substring(sourcePath.length + 1);
+                const newItemPath = relativePath ? `${targetPath}/${relativePath}` : targetPath;
+                
+                roomFiles[roomCode][newItemPath] = { ...roomFiles[roomCode][itemPath] };
+                
+                // Update active files for users
+                rooms[roomCode].forEach(userId => {
+                    if (userActiveFiles[userId] === itemPath) {
+                        userActiveFiles[userId] = newItemPath;
+                        io.to(userId).emit('active-file-changed', { fileName: newItemPath });
+                    }
+                });
+            });
+            
+            // Delete old entries
+            itemsToMove.forEach(itemPath => {
+                delete roomFiles[roomCode][itemPath];
+            });
+        } else {
+            // For files, simple move
+            roomFiles[roomCode][targetPath] = { ...roomFiles[roomCode][sourcePath] };
+            delete roomFiles[roomCode][sourcePath];
+            
+            // Update active files for users
+            rooms[roomCode].forEach(userId => {
+                if (userActiveFiles[userId] === sourcePath) {
+                    userActiveFiles[userId] = targetPath;
+                    io.to(userId).emit('active-file-changed', { fileName: targetPath });
+                }
+            });
+        }
+        
+        io.to(roomCode).emit('files-update', roomFiles[roomCode]);
+        io.to(roomCode).emit('item-moved', { sourcePath, targetPath, itemType });
+        
+        console.log(`${itemType} ${sourcePath} moved to ${targetPath} in room ${roomCode}`);
+    });
+
+    // Toggle Folder Expand/Collapse
+    socket.on('toggle-folder', ({ roomCode, folderPath }) => {
+        console.log(`Toggling folder: ${folderPath} in room: ${roomCode}`);
+        
+        if (!roomFiles[roomCode] || !roomFiles[roomCode][folderPath] || roomFiles[roomCode][folderPath].type !== 'folder') {
+            socket.emit('file-error', { message: 'Folder not found' });
+            return;
+        }
+        
+        const currentState = roomFiles[roomCode][folderPath].isExpanded || false;
+        roomFiles[roomCode][folderPath].isExpanded = !currentState;
+        
+        io.to(roomCode).emit('files-update', roomFiles[roomCode]);
+        io.to(roomCode).emit('folder-toggled', { 
+            folderPath, 
+            isExpanded: roomFiles[roomCode][folderPath].isExpanded 
+        });
+        
+        console.log(`Folder ${folderPath} toggled to ${roomFiles[roomCode][folderPath].isExpanded ? 'expanded' : 'collapsed'} in room ${roomCode}`);
+    });
+
+    // Switch File (for file selection)
     socket.on('switch-file', ({ roomCode, fileName }) => {
         console.log(`User ${socket.id} switching to file: ${fileName} in room: ${roomCode}`);
         
-        if (!roomFiles[roomCode] || !roomFiles[roomCode][fileName]) {
+        if (!roomFiles[roomCode] || !roomFiles[roomCode][fileName] || roomFiles[roomCode][fileName].type !== 'file') {
             socket.emit('file-error', { message: 'File not found' });
             return;
         }
@@ -796,7 +1094,7 @@ io.on('connection', (socket) => {
         console.log(`User ${socket.id} switched to file ${fileName} in room ${roomCode}`);
     });
 
-    // FIXED: Real-time code change handler
+    // Real-time code change handler
     socket.on('code-change', ({ roomCode, code, fileName }) => {
         console.log(`Code change in room ${roomCode}, file ${fileName || 'current'} from user ${socket.id}`);
         
@@ -807,7 +1105,7 @@ io.on('connection', (socket) => {
             return;
         }
         
-        if (roomFiles[roomCode] && roomFiles[roomCode][targetFileName]) {
+        if (roomFiles[roomCode] && roomFiles[roomCode][targetFileName] && roomFiles[roomCode][targetFileName].type === 'file') {
             // Update the file content immediately
             roomFiles[roomCode][targetFileName].content = code;
             
@@ -833,7 +1131,7 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => {
         console.log('User disconnected:', socket.id);
 
-        //clean up user session
+        // Clean up user session
         userSession.delete(socket.id);
         
         // Clean up user's terminal
@@ -900,6 +1198,7 @@ const startServer = async () => {
         server.listen(PORT, '0.0.0.0', () => {
             console.log(`Server running on port ${PORT}`);
             console.log(`Enhanced terminal support with file sync enabled`);
+            console.log(`Full folder management support added`);
             console.log(`Socket.IO server ready for connections`);
         });
 
